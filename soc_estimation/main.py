@@ -9,6 +9,7 @@ SOC估计主程序 - 完整版
 
 import sys
 import shutil
+import argparse
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -672,6 +673,12 @@ def run_single_file(data, actual_capacity, capacity_estimated, ocv_soc_table,
 
 def main():
     """主函数"""
+    parser = argparse.ArgumentParser(description='SOC Estimation System')
+    parser.add_argument('--quick', action='store_true', help='Quick test mode (3-4 files)')
+    parser.add_argument('--max-files', type=int, default=4, help='Max files in quick mode')
+    parser.add_argument('--no-ai', action='store_true', help='Skip AI training')
+    args = parser.parse_args()
+    
     print("="*80)
     print("SOC Estimation System - Complete Version")
     print("="*80)
@@ -679,6 +686,8 @@ def main():
     print("  - Traditional methods: Run on ALL files with initial SOC bias")
     print("  - EKF/PF: Online RC parameter identification integrated")
     print("  - AI: Cross-file training/test separation")
+    if args.quick:
+        print(f"  - QUICK MODE: max {args.max_files} files")
     print("="*80)
     
     output_dir = PROJECT_ROOT / "soc_results" / "detailed_results"
@@ -691,16 +700,29 @@ def main():
     raw_data_dir = PROJECT_ROOT / "raw_data"
     data_files = []
     
-    for temp_dir in raw_data_dir.glob("DST-US06-FUDS-*"):
+    for temp_dir in sorted(raw_data_dir.glob("DST-US06-FUDS-*")):
         if not temp_dir.is_dir():
             continue
-        temp_files = [f for f in temp_dir.glob("*.xlsx") 
-                     if 'newprofile' not in f.name and '20120809' not in f.name]
+        temp_files = sorted([f for f in temp_dir.glob("*.xlsx") 
+                     if 'newprofile' not in f.name and '20120809' not in f.name])
         data_files.extend(temp_files)
     
     if len(data_files) == 0:
         print("    Error: No data files found")
         return
+    
+    # Quick mode: select representative files from different temperatures
+    if args.quick:
+        selected = []
+        seen_temps = set()
+        for f in data_files:
+            temp_str = f.parent.name.split('-')[-1]  # e.g. "0C", "10C", "30C"
+            if temp_str not in seen_temps:
+                selected.append(f)
+                seen_temps.add(temp_str)
+            if len(selected) >= args.max_files:
+                break
+        data_files = selected
     
     print(f"    Found {len(data_files)} data files")
     
@@ -798,7 +820,7 @@ def main():
         })
     
     # ====== 阶段4: AI跨文件训练 ======
-    if AI_AVAILABLE:
+    if AI_AVAILABLE and not args.no_ai and not args.quick:
         print(f"\n[4] AI Cross-file Training...")
         
         train_data = [all_data[i] for i in train_indices]
@@ -873,16 +895,33 @@ def main():
                 method_maes[method] = []
             method_maes[method].append(data['metrics']['mae'])
     
-    print(f"\n  Average MAE across all files:")
+    # Also collect max errors
+    method_max_errors = {}
+    for res in all_results:
+        for method, data in res['results'].items():
+            if method not in method_max_errors:
+                method_max_errors[method] = []
+            method_max_errors[method].append(data['metrics']['max_error'])
+    
+    print(f"\n  Results across all files:")
+    print(f"  {'Method':<12} {'Avg MAE':>8} {'Std MAE':>8} {'Avg MaxErr':>10} {'Max MaxErr':>10} {'Pass':>6} {'Status':>8}")
+    print(f"  {'-'*62}")
+    all_pass = True
     for method in sorted(method_maes.keys()):
         maes = method_maes[method]
+        max_errs = method_max_errors.get(method, [])
         avg_mae = np.mean(maes)
         std_mae = np.std(maes)
+        avg_max = np.mean(max_errs) if max_errs else 0
+        worst_max = np.max(max_errs) if max_errs else 0
         pass_rate = sum(1 for m in maes if m < 5) / len(maes) * 100
         status = "PASS" if avg_mae < 5 else "FAIL"
-        print(f"    {method:<12}: MAE={avg_mae:.2f}±{std_mae:.2f}%, Pass rate={pass_rate:.0f}% [{status}]")
+        if status == "FAIL":
+            all_pass = False
+        print(f"  {method:<12} {avg_mae:>7.2f}% {std_mae:>7.2f}% {avg_max:>9.2f}% {worst_max:>9.2f}% {pass_rate:>5.0f}% [{status}]")
     
-    print(f"\n  Output directory: {output_dir}")
+    print(f"\n  Overall: {'ALL PASS' if all_pass else 'SOME FAIL'}")
+    print(f"  Output directory: {output_dir}")
     print(f"  Total files processed: {len(all_results)}")
     print(f"\n{'='*80}")
 
