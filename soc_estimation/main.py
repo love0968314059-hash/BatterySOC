@@ -268,11 +268,13 @@ class EKFWithParameterIdentification:
         S = H @ P_pred @ H.T + self.R
         K = P_pred @ H.T / (S[0, 0] + 1e-10)
         
-        # === LFP FLAT-ZONE STRATEGY ===
-        # For LFP batteries, voltage-based SOC correction is DISABLED
-        # because the flat OCV curve provides almost no SOC information.
-        # SOC is estimated purely via AH integration + OCV rest calibration.
-        soc_gain_factor = 0.0  # Disable voltage-based SOC correction
+        # === LFP ADAPTIVE VOLTAGE CORRECTION ===
+        # Enable voltage correction ONLY where OCV slope provides useful info
+        # (SOC < 15% or SOC > 85% for LFP, where slope is significant)
+        if abs(docv_dsoc) > 0.3:
+            soc_gain_factor = min(1.0, abs(docv_dsoc) / 1.0)  # Proportional to slope
+        else:
+            soc_gain_factor = 0.0  # Flat region: disable voltage correction
         
         soc_correction = K[0, 0] * soc_gain_factor * innovation
         self.soc = np.clip(soc_pred + soc_correction, 0.0, 1.0)
@@ -299,14 +301,13 @@ class EKFWithParameterIdentification:
             self._rest_count = 0
             self._was_resting = False
         
-        # OCV calibration when entering stable rest (once per rest period)
+        # OCV calibration: aggressive first trigger + continuous during rest
         if (is_rest and self._rest_count >= self._rest_calibrate_after 
-            and not self._was_resting and self.ocv_soc_table is not None):
+            and self.ocv_soc_table is not None):
             # Check voltage stability
             if len(self._voltage_buffer) >= 10:
                 v_std = np.std(self._voltage_buffer[-10:])
                 if v_std < self._voltage_stability_threshold:
-                    # OCV lookup
                     soc_vals = self.ocv_soc_table[:, 0]
                     ocv_vals = self.ocv_soc_table[:, 1]
                     v_min, v_max = ocv_vals.min(), ocv_vals.max()
@@ -314,8 +315,11 @@ class EKFWithParameterIdentification:
                     if v_min <= voltage <= v_max:
                         soc_ocv = float(np.interp(voltage, ocv_vals, soc_vals)) / 100.0
                         
-                        if abs(soc_ocv - self.soc) < 0.10:  # 10% threshold
-                            blend = 0.1
+                        if abs(soc_ocv - self.soc) < 0.30:  # 30% threshold
+                            if not self._was_resting:
+                                blend = 0.5  # Aggressive first correction
+                            else:
+                                blend = 0.05  # Continuous gradual correction
                             self.soc = self.soc + blend * (soc_ocv - self.soc)
                             self.soc = np.clip(self.soc, 0.0, 1.0)
                             self._n_calibrations += 1
@@ -551,7 +555,7 @@ class PFWithParameterIdentification:
             self._was_resting = False
         
         if (is_rest and self._rest_count >= self._rest_calibrate_after
-            and not self._was_resting and self.ocv_soc_table is not None):
+            and self.ocv_soc_table is not None):
             if len(self._voltage_buffer) >= 10:
                 v_std = np.std(self._voltage_buffer[-10:])
                 if v_std < self._voltage_stability_threshold:
@@ -562,10 +566,12 @@ class PFWithParameterIdentification:
                     if v_min <= voltage <= v_max:
                         soc_ocv = float(np.interp(voltage, ocv_vals, soc_vals)) / 100.0
                         
-                        if abs(soc_ocv - soc_est) < 0.10:  # 10% threshold
-                            blend = 0.1
+                        if abs(soc_ocv - soc_est) < 0.30:  # 30% threshold
+                            if not self._was_resting:
+                                blend = 0.5  # Aggressive first correction
+                            else:
+                                blend = 0.05  # Continuous gradual correction
                             
-                            # Apply correction to all particles
                             correction = blend * (soc_ocv - soc_est)
                             self.particles[:, 0] += correction
                             self.particles[:, 0] = np.clip(self.particles[:, 0], 0.0, 1.0)
@@ -947,14 +953,14 @@ def main():
             initial_soc_biased, data['soc_true'], evaluator
         )
         
-        # 打印结果
+        # 打印结果 (判断标准: MaxErr < 5%)
         for method, res in results.items():
             m = res['metrics']
-            status = "PASS" if m['mae'] < 5 else "FAIL"
+            status = "PASS" if m['max_error'] < 5 else "FAIL"
             extra = ""
             if 'n_calibrations' in res:
                 extra = f", OCV_cal={res['n_calibrations']}"
-            print(f"        {method:<10}: MAE={m['mae']:.2f}%, MaxErr={m['max_error']:.1f}% [{status}]{extra}")
+            print(f"        {method:<10}: MaxErr={m['max_error']:.2f}%, MAE={m['mae']:.2f}% [{status}]{extra}")
         
         # 保存结果
         filename_prefix = Path(data['filename']).stem
@@ -1065,22 +1071,22 @@ def main():
                 method_max_errors[method] = []
             method_max_errors[method].append(data['metrics']['max_error'])
     
-    print(f"\n  Results across all files:")
-    print(f"  {'Method':<12} {'Avg MAE':>8} {'Std MAE':>8} {'Avg MaxErr':>10} {'Max MaxErr':>10} {'Pass':>6} {'Status':>8}")
+    print(f"\n  Results across all files (Target: MaxErr < 5% per file):")
+    print(f"  {'Method':<12} {'Avg MAE':>8} {'Avg MaxErr':>10} {'Worst MaxErr':>12} {'Pass':>6} {'Status':>8}")
     print(f"  {'-'*62}")
     all_pass = True
     for method in sorted(method_maes.keys()):
         maes = method_maes[method]
         max_errs = method_max_errors.get(method, [])
         avg_mae = np.mean(maes)
-        std_mae = np.std(maes)
         avg_max = np.mean(max_errs) if max_errs else 0
         worst_max = np.max(max_errs) if max_errs else 0
-        pass_rate = sum(1 for m in maes if m < 5) / len(maes) * 100
-        status = "PASS" if avg_mae < 5 else "FAIL"
+        pass_count = sum(1 for e in max_errs if e < 5)
+        pass_rate = pass_count / len(max_errs) * 100 if max_errs else 0
+        status = "PASS" if all(e < 5 for e in max_errs) else "FAIL"
         if status == "FAIL":
             all_pass = False
-        print(f"  {method:<12} {avg_mae:>7.2f}% {std_mae:>7.2f}% {avg_max:>9.2f}% {worst_max:>9.2f}% {pass_rate:>5.0f}% [{status}]")
+        print(f"  {method:<12} {avg_mae:>7.2f}% {avg_max:>9.2f}% {worst_max:>11.2f}% {pass_count}/{len(max_errs):>3} [{status}]")
     
     print(f"\n  Overall: {'ALL PASS' if all_pass else 'SOME FAIL'}")
     print(f"  Output directory: {output_dir}")
