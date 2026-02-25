@@ -619,7 +619,7 @@ def run_soc_estimation(max_files=8, include_ai=True, ai_train_ratio=0.75):
         train_indices = set(indices[:n_train])
         test_indices = [i for i in range(len(all_data)) if i not in train_indices]
         
-        print(f"\n  AI Training on {n_train} files...")
+        print(f"\n  AI Training on {n_train} files (test on {len(all_data)-n_train})...")
         
         # Merge training data
         train_voltage = np.concatenate([all_data[i]['voltage'] for i in train_indices])
@@ -632,21 +632,19 @@ def run_soc_estimation(max_files=8, include_ai=True, ai_train_ratio=0.75):
             initial_soc=50.0,
             nominal_capacity=capacity_estimated,
             sequence_length=20,
-            hidden_size=64
+            hidden_size=128
         )
         
-        # Train
+        # Train with more epochs for better convergence
         ai_estimator.train(train_voltage, train_current, train_time, train_temp, train_soc,
-                          epochs=80, batch_size=256, learning_rate=0.001)
+                          epochs=150, batch_size=256, learning_rate=0.001)
         
-        # Inference on ALL files (including training files with biased initial SOC)
-        print(f"\n  AI Inference on all {len(all_data)} files...")
+        # Inference on ALL files - AI predicts from step 0 (no initial SOC dependency)
+        print(f"\n  AI Inference on all {len(all_data)} files (model predicts from step 0)...")
         for i, data in enumerate(all_data):
-            true_initial_soc = data['soc_true'][0]
-            
-            # Use corrected initial SOC
-            initial_soc_corr = all_results[i]['initial_corrected']
-            ai_estimator.initial_soc = initial_soc_corr
+            # AI model predicts directly from features, no initial SOC needed
+            # The predict_batch uses padding, so initial_soc is irrelevant
+            ai_estimator.initial_soc = 50.0  # Doesn't matter with padding
             
             soc_est = ai_estimator.predict_batch(
                 data['voltage'], data['current'], data['time'], data['temperature']
