@@ -56,15 +56,23 @@ class BatteryParameterIdentifier:
         self.tau_history = [initial_tau]
         self.v1_history = [0.0]
         
-        # 参数约束
-        self.r0_min, self.r0_max = 0.01, 0.2
-        self.r1_min, self.r1_max = 0.005, 0.1
-        self.tau_min, self.tau_max = 5.0, 200.0
+        # 参数约束 (expanded for low-temperature conditions)
+        self.r0_min, self.r0_max = 0.01, 0.3
+        self.r1_min, self.r1_max = 0.005, 0.5
+        self.tau_min, self.tau_max = 5.0, 300.0
+        
+        # Rate limiting (max change per step)
+        self.max_r0_change = 0.005   # 5 mOhm per step
+        self.max_r1_change = 0.005   # 5 mOhm per step
+        self.max_tau_change = 2.0    # 2s per step
+        
+        # Previous parameter values for rate limiting
+        self._prev_theta = self.theta.copy()
         
         # 辨识控制
         self.last_time = None
         self.n_updates = 0
-        self.excitation_threshold = 0.1  # 电流激励阈值
+        self.excitation_threshold = 0.2  # 电流激励阈值 (increased for better reliability)
     
     @property
     def r0(self):
@@ -176,10 +184,22 @@ class BatteryParameterIdentifier:
                 
                 self.n_updates += 1
         
-        # 参数约束
+        # Rate limiting: prevent sudden parameter jumps
+        delta_r0 = self.theta[0] - self._prev_theta[0]
+        delta_r1 = self.theta[1] - self._prev_theta[1]
+        delta_tau = self.theta[2] - self._prev_theta[2]
+        
+        self.theta[0] = self._prev_theta[0] + np.clip(delta_r0, -self.max_r0_change, self.max_r0_change)
+        self.theta[1] = self._prev_theta[1] + np.clip(delta_r1, -self.max_r1_change, self.max_r1_change)
+        self.theta[2] = self._prev_theta[2] + np.clip(delta_tau, -self.max_tau_change, self.max_tau_change)
+        
+        # Bounds constraints
         self.theta[0] = np.clip(self.theta[0], self.r0_min, self.r0_max)
         self.theta[1] = np.clip(self.theta[1], self.r1_min, self.r1_max)
         self.theta[2] = np.clip(self.theta[2], self.tau_min, self.tau_max)
+        
+        # Update previous values
+        self._prev_theta = self.theta.copy()
         
         # 更新V1估计（使用新参数）
         exp_factor_new = np.exp(-dt / (self.tau + 1e-6))

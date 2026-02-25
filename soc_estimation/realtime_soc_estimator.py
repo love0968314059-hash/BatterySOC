@@ -182,8 +182,6 @@ class RealtimeSOCEstimator:
             # Use minimal weight (10%) to minimize impact of OCV calibration errors
             soc_diff = soc_from_ocv - self.current_soc
             if abs(soc_diff) < 10.0:  # Only calibrate if difference < 10%
-                # Use minimal weight: 10% OCV + 90% AH-integrated
-                # This minimizes the impact of OCV calibration errors while still providing slight correction
                 calibration_weight = 0.1
                 self.current_soc = self.current_soc + soc_diff * calibration_weight
                 self.n_ocv_calibrations += 1

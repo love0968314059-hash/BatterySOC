@@ -152,7 +152,7 @@ class EKFWithParameterIdentification:
     """带RC参数在线辨识的EKF"""
     
     def __init__(self, initial_soc, nominal_capacity, ocv_soc_table=None,
-                 initial_r0=0.05, initial_r1=0.03, initial_tau=30.0):
+                 initial_r0=None, initial_r1=None, initial_tau=30.0):
         self.nominal_capacity = nominal_capacity
         self.ocv_soc_table = ocv_soc_table
         
@@ -160,16 +160,16 @@ class EKFWithParameterIdentification:
         self.soc = initial_soc / 100.0
         self.v1 = 0.0
         
-        # 协方差矩阵
-        self.P = np.diag([0.01, 0.001])
+        # 协方差矩阵 (larger initial uncertainty for SOC)
+        self.P = np.diag([0.1, 0.001])
         
-        # 参数辨识器
-        self.param_identifier = BatteryParameterIdentifier(
-            initial_r0=initial_r0, 
-            initial_r1=initial_r1, 
-            initial_tau=initial_tau,
-            forgetting_factor=0.998
-        )
+        # Save initial params for auto-estimation in estimate_batch
+        self._init_r0 = initial_r0
+        self._init_r1 = initial_r1
+        self._init_tau = initial_tau
+        
+        # Will be initialized in estimate_batch after auto-R0 estimation
+        self.param_identifier = None
         
         # 噪声参数
         self.Q = np.diag([1e-6, 1e-5])
@@ -183,6 +183,29 @@ class EKFWithParameterIdentification:
         self.r0_history = []
         self.r1_history = []
         self.tau_history = []
+        
+        # OCV calibration during rest (match AH+OCV settings)
+        self._rest_count = 0
+        self._was_resting = False
+        self._voltage_buffer = []
+        self._voltage_stability_threshold = 0.005  # 5mV (same as AH+OCV)
+        self._rest_calibrate_after = 30  # steps
+        self._n_calibrations = 0
+    
+    @staticmethod
+    def _auto_estimate_r0(voltage, current, n_steps=200):
+        """Estimate initial R0 from voltage steps in the data"""
+        r0_estimates = []
+        for i in range(1, min(n_steps, len(voltage))):
+            di = current[i] - current[i-1]
+            dv = voltage[i] - voltage[i-1]
+            if abs(di) > 0.3:  # Significant current step
+                r0_est = abs(dv / di)
+                if 0.01 < r0_est < 0.5:  # Physically reasonable
+                    r0_estimates.append(r0_est)
+        if r0_estimates:
+            return float(np.median(r0_estimates))
+        return 0.05  # Default fallback
     
     def _get_ocv(self, soc):
         """获取OCV"""
@@ -201,7 +224,7 @@ class EKFWithParameterIdentification:
         return (self._get_ocv(soc_high) - self._get_ocv(soc_low)) / (soc_high - soc_low + 1e-10)
     
     def update(self, voltage, current, time=None):
-        """单步更新"""
+        """单步更新 - LFP optimized: AH integration + OCV rest calibration"""
         # 计算时间间隔
         if time is not None and self.last_time is not None:
             dt = time - self.last_time
@@ -218,8 +241,7 @@ class EKFWithParameterIdentification:
         r1 = params['r1']
         tau = params['tau']
         
-        # === 预测步骤 ===
-        # SOC预测
+        # === 预测步骤 (AH integration - primary SOC update for LFP) ===
         delta_soc = current * dt / 3600 / self.nominal_capacity
         soc_pred = np.clip(self.soc + delta_soc, 0.0, 1.0)
         
@@ -234,46 +256,78 @@ class EKFWithParameterIdentification:
         P_pred = F @ self.P @ F.T + self.Q
         
         # === 更新步骤 ===
-        # 预测电压
         ocv_pred = self._get_ocv(soc_pred)
         v_pred = ocv_pred + current * r0 + v1_pred
         
-        # 新息
         innovation = voltage - v_pred
         self.innovation_history.append(innovation)
         
-        # 观测雅可比矩阵
         docv_dsoc = self._get_docv_dsoc(soc_pred)
         H = np.array([[docv_dsoc, 1.0]])
         
-        # 卡尔曼增益
         S = H @ P_pred @ H.T + self.R
         K = P_pred @ H.T / (S[0, 0] + 1e-10)
         
-        # 自适应增益调整
-        innovation_mv = abs(innovation) * 1000
-        if innovation_mv < 50:
-            gain_factor = 0.3
-        elif innovation_mv < 100:
-            gain_factor = 0.1
-        else:
-            gain_factor = 0.02
+        # === LFP FLAT-ZONE STRATEGY ===
+        # For LFP batteries, voltage-based SOC correction is DISABLED
+        # because the flat OCV curve provides almost no SOC information.
+        # SOC is estimated purely via AH integration + OCV rest calibration.
+        soc_gain_factor = 0.0  # Disable voltage-based SOC correction
         
-        # 更新状态
-        soc_correction = K[0, 0] * gain_factor * innovation
+        soc_correction = K[0, 0] * soc_gain_factor * innovation
         self.soc = np.clip(soc_pred + soc_correction, 0.0, 1.0)
+        
+        # V1 update still uses voltage information (V1 is observable)
         self.v1 = v1_pred + K[1, 0] * innovation
         
-        # 更新协方差
-        I_KH = np.eye(2) - gain_factor * np.outer(K, H)
-        self.P = I_KH @ P_pred
+        # Joseph form covariance update (ensures positive definiteness)
+        I_KH = np.eye(2) - np.array([[soc_gain_factor * K[0, 0]], [K[1, 0]]]) @ H
+        self.P = I_KH @ P_pred @ I_KH.T + np.outer(
+            np.array([soc_gain_factor * K[0, 0], K[1, 0]]),
+            np.array([soc_gain_factor * K[0, 0], K[1, 0]])
+        ) * self.R[0, 0]
+        
+        # === OCV REST CALIBRATION ===
+        is_rest = abs(current) < 0.05
+        self._voltage_buffer.append(voltage)
+        if len(self._voltage_buffer) > 30:
+            self._voltage_buffer.pop(0)
+        
+        if is_rest:
+            self._rest_count += 1
+        else:
+            self._rest_count = 0
+            self._was_resting = False
+        
+        # OCV calibration when entering stable rest (once per rest period)
+        if (is_rest and self._rest_count >= self._rest_calibrate_after 
+            and not self._was_resting and self.ocv_soc_table is not None):
+            # Check voltage stability
+            if len(self._voltage_buffer) >= 10:
+                v_std = np.std(self._voltage_buffer[-10:])
+                if v_std < self._voltage_stability_threshold:
+                    # OCV lookup
+                    soc_vals = self.ocv_soc_table[:, 0]
+                    ocv_vals = self.ocv_soc_table[:, 1]
+                    v_min, v_max = ocv_vals.min(), ocv_vals.max()
+                    
+                    if v_min <= voltage <= v_max:
+                        soc_ocv = float(np.interp(voltage, ocv_vals, soc_vals)) / 100.0
+                        
+                        if abs(soc_ocv - self.soc) < 0.10:  # 10% threshold
+                            blend = 0.1
+                            self.soc = self.soc + blend * (soc_ocv - self.soc)
+                            self.soc = np.clip(self.soc, 0.0, 1.0)
+                            self._n_calibrations += 1
+            
+            self._was_resting = True
         
         # 更新参数辨识
         self.param_identifier.update(voltage, current, ocv_pred, time, dt)
         
         # 记录
         self.soc_history.append(self.soc * 100.0)
-        self.kalman_gain_history.append(K[0, 0] * gain_factor)
+        self.kalman_gain_history.append(K[0, 0] * soc_gain_factor)
         self.soc_correction_history.append(soc_correction * 100.0)
         self.r0_history.append(r0)
         self.r1_history.append(r1)
@@ -291,12 +345,27 @@ class EKFWithParameterIdentification:
         self.r1_history = []
         self.tau_history = []
         self.last_time = None
+        self._rest_count = 0
+        self._was_resting = False
+        self._voltage_buffer = []
         
         voltage = np.asarray(voltage)
         current = np.asarray(current)
         if time is None:
             time = np.arange(len(voltage))
         time = np.asarray(time)
+        
+        # Auto-estimate R0 from data
+        auto_r0 = self._auto_estimate_r0(voltage, current)
+        r0 = self._init_r0 if self._init_r0 is not None else auto_r0
+        r1 = self._init_r1 if self._init_r1 is not None else max(0.01, auto_r0 * 0.5)
+        tau = self._init_tau if self._init_tau is not None else 30.0
+        
+        # Initialize parameter identifier with auto-estimated values
+        self.param_identifier = BatteryParameterIdentifier(
+            initial_r0=r0, initial_r1=r1, initial_tau=tau,
+            forgetting_factor=0.998
+        )
         
         soc_estimated = []
         for i in range(len(voltage)):
@@ -324,10 +393,11 @@ class PFWithParameterIdentification:
     """带RC参数在线辨识的粒子滤波"""
     
     def __init__(self, initial_soc, nominal_capacity, ocv_soc_table=None,
-                 n_particles=200, initial_r0=0.05, initial_r1=0.03, initial_tau=30.0):
+                 n_particles=200, initial_r0=None, initial_r1=None, initial_tau=30.0):
         self.nominal_capacity = nominal_capacity
         self.ocv_soc_table = ocv_soc_table
         self.n_particles = n_particles
+        self.initial_soc = initial_soc
         
         # 粒子初始化: [SOC, V1]
         self.particles = np.zeros((n_particles, 2))
@@ -337,22 +407,31 @@ class PFWithParameterIdentification:
         
         self.weights = np.ones(n_particles) / n_particles
         
-        # 参数辨识器
-        self.param_identifier = BatteryParameterIdentifier(
-            initial_r0=initial_r0, 
-            initial_r1=initial_r1, 
-            initial_tau=initial_tau,
-            forgetting_factor=0.998
-        )
+        # Save initial params for auto-estimation
+        self._init_r0 = initial_r0
+        self._init_r1 = initial_r1
+        self._init_tau = initial_tau
+        
+        # Will be initialized in estimate_batch
+        self.param_identifier = None
         
         self.process_noise = 0.001
         self.measurement_noise = 0.001
         
         self.last_time = None
+        self.soc = initial_soc / 100.0
         self.soc_history = []
         self.r0_history = []
         self.r1_history = []
         self.tau_history = []
+        
+        # OCV calibration during rest (match AH+OCV settings)
+        self._rest_count = 0
+        self._was_resting = False
+        self._voltage_buffer = []
+        self._voltage_stability_threshold = 0.005  # 5mV (same as AH+OCV)
+        self._rest_calibrate_after = 30
+        self._n_calibrations = 0
     
     def _get_ocv(self, soc):
         """获取OCV"""
@@ -363,8 +442,15 @@ class PFWithParameterIdentification:
         ocv_values = self.ocv_soc_table[:, 1]
         return np.interp(soc_percent, soc_values, ocv_values)
     
+    def _get_docv_dsoc(self, soc):
+        """获取dOCV/dSOC for flat-zone detection"""
+        delta = 0.001
+        soc_high = min(soc + delta, 1.0)
+        soc_low = max(soc - delta, 0.0)
+        return (self._get_ocv(soc_high) - self._get_ocv(soc_low)) / (soc_high - soc_low + 1e-10)
+    
     def update(self, voltage, current, time=None):
-        """单步更新"""
+        """单步更新 - LFP optimized with flat-zone noise adaptation"""
         # 计算时间间隔
         if time is not None and self.last_time is not None:
             dt = time - self.last_time
@@ -381,59 +467,113 @@ class PFWithParameterIdentification:
         r1 = params['r1']
         tau = params['tau']
         
+        # === Adaptive measurement noise based on OCV slope ===
+        # In flat OCV region, increase noise to effectively ignore voltage for SOC
+        mean_soc = np.mean(self.particles[:, 0])
+        slope = abs(self._get_docv_dsoc(mean_soc))
+        if slope < 0.2:  # Flat region
+            meas_noise = self.measurement_noise * 10.0
+        elif slope < 0.5:
+            meas_noise = self.measurement_noise * 3.0
+        else:
+            meas_noise = self.measurement_noise
+        
         # === 预测步骤 ===
         exp_factor = np.exp(-dt / (tau + 1e-6))
         
-        for i in range(self.n_particles):
-            # SOC更新
-            delta_soc = current * dt / 3600 / self.nominal_capacity
-            self.particles[i, 0] += delta_soc
-            self.particles[i, 0] = np.clip(self.particles[i, 0], 0.0, 1.0)
-            self.particles[i, 0] += np.random.normal(0, self.process_noise * 0.1)
-            self.particles[i, 0] = np.clip(self.particles[i, 0], 0.0, 1.0)
-            
-            # V1更新
-            self.particles[i, 1] = (self.particles[i, 1] * exp_factor + 
-                                    current * r1 * (1 - exp_factor))
-            self.particles[i, 1] += np.random.normal(0, self.process_noise * 0.01)
+        # Vectorized particle prediction
+        delta_soc = current * dt / 3600 / self.nominal_capacity
         
-        # === 更新步骤 ===
-        for i in range(self.n_particles):
-            ocv = self._get_ocv(self.particles[i, 0])
-            v_pred = ocv + current * r0 + self.particles[i, 1]
-            
-            error = voltage - v_pred
-            log_weight = -0.5 * (error ** 2) / (self.measurement_noise ** 2)
-            log_weight = np.clip(log_weight, -50, 50)
-            self.weights[i] = np.exp(log_weight)
+        # SOC update: deterministic AH integration (no noise - prevents drift in flat OCV)
+        self.particles[:, 0] += delta_soc
+        self.particles[:, 0] = np.clip(self.particles[:, 0], 0.0, 1.0)
         
-        # 归一化权重
-        weight_sum = np.sum(self.weights)
-        if weight_sum > 1e-10:
-            self.weights /= weight_sum
-        else:
-            self.weights = np.ones(self.n_particles) / self.n_particles
+        # V1 update with small noise for diversity
+        self.particles[:, 1] = (self.particles[:, 1] * exp_factor + 
+                                current * r1 * (1 - exp_factor))
+        self.particles[:, 1] += np.random.normal(0, self.process_noise * 0.01, self.n_particles)
         
-        # 重采样
-        weight_sum_sq = np.sum(self.weights ** 2)
-        neff = 1.0 / (weight_sum_sq + 1e-10)
-        
-        if neff < self.n_particles / 2:
-            cumsum = np.cumsum(self.weights)
-            cumsum[-1] = 1.0
-            u = (np.random.rand() + np.arange(self.n_particles)) / self.n_particles
-            new_particles = np.zeros_like(self.particles)
-            j = 0
+        # === 更新步骤 (with flat-zone bypass) ===
+        if slope >= 0.2:
+            # Non-flat region: use voltage-based particle weighting
             for i in range(self.n_particles):
-                while j < len(cumsum) - 1 and u[i] > cumsum[j]:
-                    j += 1
-                new_particles[i] = self.particles[j]
-            self.particles = new_particles
+                ocv = self._get_ocv(self.particles[i, 0])
+                v_pred = ocv + current * r0 + self.particles[i, 1]
+                
+                error = voltage - v_pred
+                log_weight = -0.5 * (error ** 2) / (meas_noise ** 2)
+                log_weight = np.clip(log_weight, -50, 50)
+                self.weights[i] = np.exp(log_weight)
+            
+            # 归一化权重
+            weight_sum = np.sum(self.weights)
+            if weight_sum > 1e-10:
+                self.weights /= weight_sum
+            else:
+                self.weights = np.ones(self.n_particles) / self.n_particles
+            
+            # 重采样
+            weight_sum_sq = np.sum(self.weights ** 2)
+            neff = 1.0 / (weight_sum_sq + 1e-10)
+            
+            if neff < self.n_particles / 2:
+                cumsum = np.cumsum(self.weights)
+                cumsum[-1] = 1.0
+                u = (np.random.rand() + np.arange(self.n_particles)) / self.n_particles
+                new_particles = np.zeros_like(self.particles)
+                j = 0
+                for i in range(self.n_particles):
+                    while j < len(cumsum) - 1 and u[i] > cumsum[j]:
+                        j += 1
+                    new_particles[i] = self.particles[j]
+                self.particles = new_particles
+                self.weights = np.ones(self.n_particles) / self.n_particles
+        else:
+            # Flat OCV region: skip voltage-based weighting entirely
+            # SOC relies on AH integration + OCV rest calibration only
             self.weights = np.ones(self.n_particles) / self.n_particles
         
         # 估计SOC
         soc_est = np.sum(self.particles[:, 0] * self.weights)
         soc_est = np.clip(soc_est, 0.0, 1.0)
+        self.soc = soc_est
+        
+        # === OCV REST CALIBRATION ===
+        is_rest = abs(current) < 0.05
+        self._voltage_buffer.append(voltage)
+        if len(self._voltage_buffer) > 30:
+            self._voltage_buffer.pop(0)
+        
+        if is_rest:
+            self._rest_count += 1
+        else:
+            self._rest_count = 0
+            self._was_resting = False
+        
+        if (is_rest and self._rest_count >= self._rest_calibrate_after
+            and not self._was_resting and self.ocv_soc_table is not None):
+            if len(self._voltage_buffer) >= 10:
+                v_std = np.std(self._voltage_buffer[-10:])
+                if v_std < self._voltage_stability_threshold:
+                    soc_vals = self.ocv_soc_table[:, 0]
+                    ocv_vals = self.ocv_soc_table[:, 1]
+                    v_min, v_max = ocv_vals.min(), ocv_vals.max()
+                    
+                    if v_min <= voltage <= v_max:
+                        soc_ocv = float(np.interp(voltage, ocv_vals, soc_vals)) / 100.0
+                        
+                        if abs(soc_ocv - soc_est) < 0.10:  # 10% threshold
+                            blend = 0.1
+                            
+                            # Apply correction to all particles
+                            correction = blend * (soc_ocv - soc_est)
+                            self.particles[:, 0] += correction
+                            self.particles[:, 0] = np.clip(self.particles[:, 0], 0.0, 1.0)
+                            soc_est = np.clip(soc_est + correction, 0.0, 1.0)
+                            self.soc = soc_est
+                            self._n_calibrations += 1
+            
+            self._was_resting = True
         
         # 更新参数辨识
         ocv_est = self._get_ocv(soc_est)
@@ -454,19 +594,34 @@ class PFWithParameterIdentification:
         self.r1_history = []
         self.tau_history = []
         self.last_time = None
-        
-        # 重新初始化粒子
-        initial_soc = self.particles[0, 0]  # 保存初始SOC
-        self.particles[:, 0] = np.random.normal(initial_soc, 0.02, self.n_particles)
-        self.particles[:, 0] = np.clip(self.particles[:, 0], 0.0, 1.0)
-        self.particles[:, 1] = np.random.normal(0.0, 0.001, self.n_particles)
-        self.weights = np.ones(self.n_particles) / self.n_particles
+        self._rest_count = 0
+        self._was_resting = False
+        self._voltage_buffer = []
         
         voltage = np.asarray(voltage)
         current = np.asarray(current)
         if time is None:
             time = np.arange(len(voltage))
         time = np.asarray(time)
+        
+        # Auto-estimate R0 from data
+        auto_r0 = EKFWithParameterIdentification._auto_estimate_r0(voltage, current)
+        r0 = self._init_r0 if self._init_r0 is not None else auto_r0
+        r1 = self._init_r1 if self._init_r1 is not None else max(0.01, auto_r0 * 0.5)
+        tau = self._init_tau if self._init_tau is not None else 30.0
+        
+        # Initialize parameter identifier
+        self.param_identifier = BatteryParameterIdentifier(
+            initial_r0=r0, initial_r1=r1, initial_tau=tau,
+            forgetting_factor=0.998
+        )
+        
+        # 重新初始化粒子
+        self.soc = self.initial_soc / 100.0
+        self.particles[:, 0] = np.random.normal(self.initial_soc / 100.0, 0.02, self.n_particles)
+        self.particles[:, 0] = np.clip(self.particles[:, 0], 0.0, 1.0)
+        self.particles[:, 1] = np.random.normal(0.0, 0.001, self.n_particles)
+        self.weights = np.ones(self.n_particles) / self.n_particles
         
         soc_estimated = []
         for i in range(len(voltage)):
@@ -638,7 +793,8 @@ def run_single_file(data, actual_capacity, capacity_estimated, ocv_soc_table,
     soc_est = estimator.estimate_batch(voltage, current, time, temperature)
     results['AH+OCV'] = {
         'soc_est': soc_est,
-        'metrics': evaluator.evaluate(soc_true, soc_est)
+        'metrics': evaluator.evaluate(soc_true, soc_est),
+        'n_calibrations': estimator.n_ocv_calibrations
     }
     
     # 2. EKF with Parameter Identification
@@ -651,7 +807,8 @@ def run_single_file(data, actual_capacity, capacity_estimated, ocv_soc_table,
     results['EKF-PI'] = {
         'soc_est': soc_est,
         'metrics': evaluator.evaluate(soc_true, soc_est),
-        'diagnostics': ekf.get_diagnostics()
+        'diagnostics': ekf.get_diagnostics(),
+        'n_calibrations': ekf._n_calibrations
     }
     
     # 3. PF with Parameter Identification
@@ -665,7 +822,8 @@ def run_single_file(data, actual_capacity, capacity_estimated, ocv_soc_table,
     results['PF-PI'] = {
         'soc_est': soc_est,
         'metrics': evaluator.evaluate(soc_true, soc_est),
-        'diagnostics': pf.get_diagnostics()
+        'diagnostics': pf.get_diagnostics(),
+        'n_calibrations': pf._n_calibrations
     }
     
     return results
@@ -774,10 +932,11 @@ def main():
     print(f"\n[3] Running traditional methods on ALL files...")
     
     all_results = []
+    bias_rng = np.random.RandomState(42)  # Separate RNG for deterministic bias
     
     for i, data in enumerate(all_data):
         true_initial_soc = data['soc_true'][0]
-        bias_sign = 1 if np.random.rand() > 0.5 else -1
+        bias_sign = 1 if bias_rng.rand() > 0.5 else -1
         initial_soc_biased = np.clip(true_initial_soc + bias_sign * INITIAL_SOC_BIAS, 0, 100)
         
         print(f"\n    [{i+1}/{len(all_data)}] {data['filename']}")
@@ -792,7 +951,10 @@ def main():
         for method, res in results.items():
             m = res['metrics']
             status = "PASS" if m['mae'] < 5 else "FAIL"
-            print(f"        {method:<10}: MAE={m['mae']:.2f}%, RMSE={m['rmse']:.2f}% [{status}]")
+            extra = ""
+            if 'n_calibrations' in res:
+                extra = f", OCV_cal={res['n_calibrations']}"
+            print(f"        {method:<10}: MAE={m['mae']:.2f}%, MaxErr={m['max_error']:.1f}% [{status}]{extra}")
         
         # 保存结果
         filename_prefix = Path(data['filename']).stem
