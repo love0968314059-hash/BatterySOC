@@ -142,38 +142,32 @@ class RealtimeSOCEstimator:
         else:
             rest_duration = 0.0
         
-        # OCV calibration strategy:
-        # - First trigger at rest_threshold: aggressive correction (weight=0.5)
-        # - Continuous during rest: gradual correction (weight=0.05/step)
-        # - Voltage stability required for all calibrations
-        can_calibrate_first = False
-        can_calibrate_continuous = False
-        
-        if (is_rest and rest_duration >= self.rest_duration_threshold
-            and self.ocv_soc_table is not None):
-            # Check voltage stability
-            voltage_stable = True
+        # Determine if OCV calibration condition is met (only calibrate once when threshold is first reached)
+        # Fix: use was_resting flag to track if already in rest state
+        # Improved: only calibrate if voltage is stable and difference is reasonable
+        can_calibrate = False
+        if (is_rest and 
+            rest_duration >= self.rest_duration_threshold and
+            not self.was_resting and
+            self.ocv_soc_table is not None):
+            # Additional check: voltage stability (voltage should be stable during rest)
             if len(self.voltage_history) >= 10:
                 recent_voltages = np.array(self.voltage_history[-10:])
                 voltage_std = np.std(recent_voltages)
-                if voltage_std >= 0.005:
-                    voltage_stable = False
-            
-            if voltage_stable:
-                if not self.was_resting:
-                    can_calibrate_first = True  # First trigger - aggressive
-                else:
-                    can_calibrate_continuous = True  # Continuous - gradual
+                if voltage_std < 0.005:  # Voltage is stable (<5mV variation)
+                    can_calibrate = True
+            else:
+                can_calibrate = True  # If not enough history, allow calibration
         
         # Update was_resting flag
         if is_rest and rest_duration >= self.rest_duration_threshold:
             self.was_resting = True
         elif not is_rest:
-            self.was_resting = False
+            self.was_resting = False  # Reset flag once leaving rest state
         
         # Update SOC
-        if can_calibrate_first or can_calibrate_continuous:
-            # OCV calibration
+        if can_calibrate:
+            # OCV calibration: use OCV-SOC curve mapping (only calibrate once when entering rest state)
             ocv_soc_ocv = self.ocv_soc_table[:, 1]
             
             if voltage < ocv_soc_ocv.min():
@@ -183,17 +177,15 @@ class RealtimeSOCEstimator:
             else:
                 soc_from_ocv = float(self.ocv_to_soc_interp(voltage))
             
+            # OCV calibration: very conservative weighted correction
+            # Only calibrate if difference is reasonable (<10%) and voltage is very stable
+            # Use minimal weight (10%) to minimize impact of OCV calibration errors
             soc_diff = soc_from_ocv - self.current_soc
-            
-            # Allow larger corrections (up to 30% diff) to handle initial bias
-            if abs(soc_diff) < 30.0:
-                if can_calibrate_first:
-                    calibration_weight = 0.5  # Aggressive first correction
-                else:
-                    calibration_weight = 0.05  # Continuous gradual correction
-                
+            if abs(soc_diff) < 10.0:  # Only calibrate if difference < 10%
+                calibration_weight = 0.1
                 self.current_soc = self.current_soc + soc_diff * calibration_weight
                 self.n_ocv_calibrations += 1
+            # If difference is too large, skip calibration to avoid large errors
         else:
             # AH integration update (including rest periods, as OCV calibration only happens once when threshold is reached)
             # Key fix: continue integration even at boundaries, allow temporary exceedance before clipping

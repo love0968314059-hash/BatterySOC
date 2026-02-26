@@ -163,28 +163,78 @@ class ImprovedAISOCEstimator:
         
         return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
     
+    def train_multi_file(self, file_data_list, epochs=150, batch_size=256, learning_rate=0.001):
+        """
+        多文件训练 - 避免跨文件边界创建序列
+        file_data_list: list of dicts with keys: voltage, current, time, temperature, soc_true
+        """
+        print(f"  训练AI模型 ({len(file_data_list)} files)...")
+        
+        # 先计算全局特征统计
+        all_features = []
+        for fd in file_data_list:
+            feat = self._prepare_features(fd['voltage'], fd['current'], fd['time'], fd['temperature'])
+            all_features.append(feat)
+        
+        all_features_concat = np.concatenate(all_features)
+        self.feature_mean = np.mean(all_features_concat, axis=0)
+        self.feature_std = np.std(all_features_concat, axis=0) + 1e-8
+        
+        # 每个文件单独创建序列（避免跨文件边界）
+        X_all, y_all = [], []
+        for fd in file_data_list:
+            features = self._prepare_features(fd['voltage'], fd['current'], fd['time'], fd['temperature'])
+            features_norm = (features - self.feature_mean) / self.feature_std
+            soc_norm = np.asarray(fd['soc_true'], dtype=np.float32) / 100.0
+            
+            # 正常序列
+            X, y = self._create_sequences(features_norm, soc_norm)
+            X_all.append(X)
+            y_all.append(y)
+            
+            # Padded warmup sequences for this file
+            for i in range(min(self.sequence_length, len(features_norm))):
+                seq = np.zeros((self.sequence_length, features_norm.shape[1]), dtype=np.float32)
+                available = features_norm[:i+1]
+                pad_len = self.sequence_length - len(available)
+                if pad_len > 0:
+                    seq[:pad_len] = features_norm[0]
+                seq[pad_len:] = available
+                X_all.append(seq.reshape(1, *seq.shape))
+                y_all.append(np.array([soc_norm[i]], dtype=np.float32))
+        
+        X = np.concatenate(X_all)
+        y = np.concatenate(y_all)
+        
+        print(f"    训练样本: {len(X)}, 序列长度: {self.sequence_length}")
+        
+        # Shuffle and split
+        rng = np.random.RandomState(42)
+        indices = rng.permutation(len(X))
+        n_train = int(len(X) * 0.9)
+        train_idx = indices[:n_train]
+        val_idx = indices[n_train:]
+        
+        X_train, X_val = X[train_idx], X[val_idx]
+        y_train, y_val = y[train_idx], y[val_idx]
+        
+        self._do_training(X_train, y_train, X_val, y_val, epochs, batch_size, learning_rate)
+    
     def train(self, voltage, current, time, temperature, soc_true,
               epochs=150, batch_size=256, learning_rate=0.001):
-        """训练模型"""
+        """训练模型 (单文件拼接版本 - 向后兼容)"""
         print(f"  训练AI模型...")
         
-        # 准备特征
         features = self._prepare_features(voltage, current, time, temperature)
-        
-        # 特征归一化
         self.feature_mean = np.mean(features, axis=0)
         self.feature_std = np.std(features, axis=0) + 1e-8
         features_norm = (features - self.feature_mean) / self.feature_std
-        
-        # SOC归一化到0-1
         soc_norm = np.asarray(soc_true, dtype=np.float32) / 100.0
         
-        # 创建序列 (including padded sequences for warmup training)
         X, y = self._create_sequences(features_norm, soc_norm)
         
-        # Also add padded sequences to train the model for warmup handling
-        X_padded = []
-        y_padded = []
+        # Padded warmup sequences
+        X_padded, y_padded = [], []
         for i in range(min(self.sequence_length, len(features_norm))):
             seq = np.zeros((self.sequence_length, features_norm.shape[1]), dtype=np.float32)
             available = features_norm[:i+1]
@@ -196,24 +246,23 @@ class ImprovedAISOCEstimator:
             y_padded.append(soc_norm[i])
         
         if X_padded:
-            X_padded = np.array(X_padded, dtype=np.float32)
-            y_padded = np.array(y_padded, dtype=np.float32)
-            X = np.concatenate([X_padded, X])
-            y = np.concatenate([y_padded, y])
+            X = np.concatenate([np.array(X_padded, dtype=np.float32), X])
+            y = np.concatenate([np.array(y_padded, dtype=np.float32), y])
         
         print(f"    训练样本: {len(X)}, 序列长度: {self.sequence_length}")
         
-        # 划分训练集和验证集 (shuffle before split)
         rng = np.random.RandomState(42)
         indices = rng.permutation(len(X))
-        n_train = int(len(X) * 0.85)
-        train_idx = indices[:n_train]
-        val_idx = indices[n_train:]
+        n_train = int(len(X) * 0.9)
+        X_train, X_val = X[indices[:n_train]], X[indices[n_train:]]
+        y_train, y_val = y[indices[:n_train]], y[indices[n_train:]]
         
-        X_train, X_val = X[train_idx], X[val_idx]
-        y_train, y_val = y[train_idx], y[val_idx]
+        self._do_training(X_train, y_train, X_val, y_val, epochs, batch_size, learning_rate)
+    
+    def _do_training(self, X_train, y_train, X_val, y_val,
+                     epochs=150, batch_size=256, learning_rate=0.001):
+        """核心训练逻辑"""
         
-        # 创建DataLoader
         train_dataset = TensorDataset(
             torch.FloatTensor(X_train),
             torch.FloatTensor(y_train.reshape(-1, 1))
@@ -226,14 +275,12 @@ class ImprovedAISOCEstimator:
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
         val_loader = DataLoader(val_dataset, batch_size=batch_size)
         
-        # 优化器 with learning rate scheduler
-        optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5)
+        optimizer = optim.Adam(self.model.parameters(), lr=learning_rate, weight_decay=1e-5)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=8, factor=0.5)
         criterion = nn.MSELoss()
         
-        # 训练
         best_val_loss = float('inf')
-        patience = 20
+        patience = 25
         patience_counter = 0
         
         # 清空训练历史
