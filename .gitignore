@@ -16,6 +16,9 @@ raw_data/*/*.xls
 soc_results/
 soc_estimation/soc_results/
 
+# Saved models (tracked by git for deployment)
+# DO NOT ignore saved_models/ - these are needed for inference
+
 # OS
 .DS_Store
 Thumbs.db

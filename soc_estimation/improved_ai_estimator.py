@@ -6,6 +6,7 @@
 """
 
 import numpy as np
+import json
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -414,6 +415,103 @@ class ImprovedAISOCEstimator:
         else:
             # 未训练时使用AH积分
             return self._ah_integration(voltage, current, time, temperature)
+    
+    def save_model(self, save_dir, model_name="soc_gru_model"):
+        """
+        保存训练好的模型和配置参数
+        
+        Args:
+            save_dir: 保存目录
+            model_name: 模型名称前缀
+        
+        保存文件:
+            - {model_name}.pth: PyTorch模型权重
+            - {model_name}_config.json: 模型配置和归一化参数
+        """
+        import os
+        os.makedirs(save_dir, exist_ok=True)
+        
+        if not self.is_trained:
+            raise RuntimeError("模型未训练，无法保存")
+        
+        # 保存模型权重
+        model_path = os.path.join(save_dir, f"{model_name}.pth")
+        torch.save(self.model.state_dict(), model_path)
+        
+        # 保存配置和归一化参数
+        config = {
+            'model_type': self.model_type,
+            'input_size': self.input_size,
+            'sequence_length': self.sequence_length,
+            'hidden_size': self.model.gru.hidden_size,
+            'num_layers': self.model.gru.num_layers,
+            'nominal_capacity': self.nominal_capacity,
+            'feature_mean': self.feature_mean.tolist(),
+            'feature_std': self.feature_std.tolist(),
+            'feature_names': ['voltage', 'current', 'temperature', 'dt', 'cumulative_ah_norm', 'power'],
+            'training_history': {
+                'train_loss': [float(x) for x in self.training_history.get('train_loss', [])],
+                'val_loss': [float(x) for x in self.training_history.get('val_loss', [])],
+            }
+        }
+        
+        config_path = os.path.join(save_dir, f"{model_name}_config.json")
+        with open(config_path, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
+        
+        print(f"  模型已保存:")
+        print(f"    权重: {model_path}")
+        print(f"    配置: {config_path}")
+        return model_path, config_path
+    
+    @classmethod
+    def load_model(cls, save_dir, model_name="soc_gru_model", device='cpu'):
+        """
+        从文件加载预训练模型
+        
+        Args:
+            save_dir: 模型保存目录
+            model_name: 模型名称前缀
+            device: 设备 ('cpu' 或 'cuda')
+            
+        Returns:
+            ImprovedAISOCEstimator: 加载了预训练权重的估计器
+        """
+        import os
+        
+        # 加载配置
+        config_path = os.path.join(save_dir, f"{model_name}_config.json")
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+        
+        # 创建估计器
+        estimator = cls(
+            initial_soc=50.0,
+            nominal_capacity=config['nominal_capacity'],
+            sequence_length=config['sequence_length'],
+            hidden_size=config['hidden_size'],
+            num_layers=config['num_layers'],
+            device=device
+        )
+        
+        # 加载归一化参数
+        estimator.feature_mean = np.array(config['feature_mean'], dtype=np.float32)
+        estimator.feature_std = np.array(config['feature_std'], dtype=np.float32)
+        
+        # 加载训练历史
+        estimator.training_history = config.get('training_history', {'train_loss': [], 'val_loss': []})
+        
+        # 加载模型权重
+        model_path = os.path.join(save_dir, f"{model_name}.pth")
+        estimator.model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+        estimator.model.eval()
+        estimator.is_trained = True
+        
+        print(f"  模型已加载: {model_path}")
+        print(f"    序列长度: {config['sequence_length']}, 隐藏层: {config['hidden_size']}")
+        print(f"    特征: {config['feature_names']}")
+        
+        return estimator
     
     def _ah_integration(self, voltage, current, time, temperature):
         """AH积分备选方案"""
